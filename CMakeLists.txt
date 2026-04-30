@@ -151,7 +151,7 @@ function(set_target_common_gns_properties TGT)
 		target_compile_options(${TGT} PRIVATE -ffunction-sections -fdata-sections ${TARGET_ARCH_FLAGS})
 	endif()
 
-	if(CMAKE_SYSTEM_NAME MATCHES Linux)
+	if(CMAKE_SYSTEM_NAME MATCHES Linux OR ANDROID)
 		target_compile_definitions(${TGT} PUBLIC LINUX)
 	elseif(CMAKE_SYSTEM_NAME MATCHES Darwin)
 		target_compile_definitions(${TGT} PUBLIC OSX)

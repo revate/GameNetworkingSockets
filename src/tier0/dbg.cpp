@@ -117,6 +117,8 @@ bool Plat_IsInDebugSession()
 		}
 	}
 	return (nTracePid != 0);
+#elif IsAndroid()
+	return false;
 #elif IsPlaystation()
 	// NDA material
 #elif IsNintendoSwitch()

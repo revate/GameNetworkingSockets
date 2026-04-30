@@ -321,7 +321,7 @@ macro(set_clientlib_target_properties GNS_TARGET)
 		endforeach()
 	endif()
 
-	if(CMAKE_SYSTEM_NAME MATCHES Linux)
+	if(CMAKE_SYSTEM_NAME MATCHES Linux OR ANDROID)
 		#if(USE_STEAMWEBRTC AND NOT STEAMWEBRTC_USE_STATIC_LIBS)
 		#	target_link_libraries(${GNS_TARGET} PRIVATE dl)
 		#endif()
