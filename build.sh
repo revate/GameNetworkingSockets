@@ -24,7 +24,8 @@ cmake -S "$SCRIPT_DIR" -B "$BUILD_DIR" \
     -DBUILD_TESTS=OFF \
     -DBUILD_EXAMPLES=OFF \
     -DUSE_STEAMWEBRTC=OFF \
-    -Dprotobuf_MSVC_STATIC_RUNTIME=OFF
+    -Dprotobuf_MSVC_STATIC_RUNTIME=OFF \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON
 
 cmake --build "$BUILD_DIR" --config "$BUILD_TYPE" -j"$(nproc)"
 
