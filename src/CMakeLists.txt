@@ -325,7 +325,13 @@ macro(set_clientlib_target_properties GNS_TARGET)
 		#if(USE_STEAMWEBRTC AND NOT STEAMWEBRTC_USE_STATIC_LIBS)
 		#	target_link_libraries(${GNS_TARGET} PRIVATE dl)
 		#endif()
-	elseif(CMAKE_SYSTEM_NAME MATCHES Darwin)
+		if(ANDROID)
+			# OpenSSL's libcrypto.a (linked statically) references
+			# __android_log_write; static libs don't carry their lib deps, so
+			# link Android's liblog (+ libandroid) here, after the objects.
+			target_link_libraries(${GNS_TARGET} PUBLIC log android)
+		endif()
+	elseif(CMAKE_SYSTEM_NAME MATCHES "Darwin|iOS")
 		#if(USE_STEAMWEBRTC AND NOT STEAMWEBRTC_USE_STATIC_LIBS)
 		#	target_link_libraries(${GNS_TARGET} PRIVATE dl)
 		#endif()

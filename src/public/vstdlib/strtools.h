@@ -124,7 +124,7 @@ extern int V_StrTrim( char *pStr );
 #define _strtoi64 strtoll
 #define _strtoui64 strtoull
 #define _vsnprintf vsnprintf
-#if IsOSX() || IsAndroid()
+#if IsOSX() || IsIOS() || IsAndroid()
 // TODO - OSX doesn't support wcscasecmp until 10.7, so just
 // use a basic implementation of our own.
 #define _wcsicmp vstdlib_wcsicmp
