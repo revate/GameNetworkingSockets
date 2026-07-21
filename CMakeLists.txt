@@ -159,7 +159,7 @@ function(set_target_common_gns_properties TGT)
 
 	if(CMAKE_SYSTEM_NAME MATCHES Linux OR ANDROID)
 		target_compile_definitions(${TGT} PUBLIC LINUX)
-	elseif(CMAKE_SYSTEM_NAME MATCHES Darwin)
+	elseif(CMAKE_SYSTEM_NAME MATCHES "Darwin|iOS")
 		target_compile_definitions(${TGT} PUBLIC OSX)
 	elseif(CMAKE_SYSTEM_NAME MATCHES FreeBSD)
 		target_compile_definitions(${TGT} PUBLIC FREEBSD)

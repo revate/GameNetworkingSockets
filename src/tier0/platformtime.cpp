@@ -9,7 +9,7 @@
 #else
 	#include <sys/time.h>
 	#include <unistd.h>
-	#if IsOSX()
+	#if IsOSX() || IsIOS()
 		#include <mach/mach.h>
 		#include <mach/mach_time.h>
 	#endif
@@ -22,7 +22,7 @@
 
 BEGIN_TIER0_NAMESPACE
 
-#if defined( _WIN32 ) || IsOSX() || IsNintendoSwitch()
+#if defined( _WIN32 ) || IsOSX() || IsIOS() || IsNintendoSwitch()
 	static uint64 g_TickFrequency;
 	static double g_TickFrequencyDouble;
 	static double g_TicksToUS;
@@ -57,7 +57,7 @@ static uint64 InitTicks()
 	// Before Windows Vista, multicore system QPC can be non-monotonic 
 	QueryPerformanceCounter( &Large );
 	g_TickBase = g_TickLastReturned_XPWorkaround = Large.QuadPart;
-#elif IsOSX()
+#elif IsOSX() || IsIOS()
 	mach_timebase_info_data_t TimebaseInfo;
 	mach_timebase_info(&TimebaseInfo);
 	g_TickFrequencyDouble = (double) TimebaseInfo.denom / (double) TimebaseInfo.numer * 1.0e9;
@@ -76,7 +76,7 @@ static uint64 InitTicks()
 #error Unknown platform
 #endif
 
-	#if defined( _WIN32 ) || IsOSX() || IsNintendoSwitch()
+	#if defined( _WIN32 ) || IsOSX() || IsIOS() || IsNintendoSwitch()
 		g_TicksToUS = 1.0e6 / g_TickFrequencyDouble;
 	#endif
 
@@ -103,7 +103,7 @@ uint64 Plat_RelativeTicks()
 	{
 		g_TickLastReturned_XPWorkaround = Ticks;
 	}
-#elif IsOSX()
+#elif IsOSX() || IsIOS()
 	Ticks = mach_absolute_time();
 #elif IsNintendoSwitch()
     Ticks = PlatformTime_GetRawTickCounter();

@@ -49,7 +49,7 @@
 #define PLAT_DLL_EXT "dll"
 #elif IsLinux()
 #define PLAT_DLL_EXT "so"
-#elif IsOSX()
+#elif IsOSX() || IsIOS()
 #define PLAT_DLL_EXT "dylib"
 #endif
 
