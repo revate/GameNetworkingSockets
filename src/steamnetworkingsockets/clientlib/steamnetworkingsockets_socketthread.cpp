@@ -30,6 +30,7 @@
 	#include <sys/types.h>
 	#if !IsNintendoSwitch()
 		#include <sys/socket.h>
+		#include <cerrno>   // REVATE: sendmmsg flush retry
 	#endif
 	#ifdef STEAMNETWORKINGSOCKETS_ENABLE_RESOLVEHOSTNAME
 		#include <netdb.h>
@@ -91,6 +92,41 @@ constexpr int k_cbETWEventUDPPacketDataSize = 16;
 namespace SteamNetworkingSocketsLib {
 
 constexpr int k_msMaxPollWait = 1000;
+
+// ── REVATE: batched UDP sends (2026-10-07) ─────────────────────────────────────
+// On a rented 4-core box holding 56 game worlds the service thread was 21 % of a
+// world's CPU, 6 % of it one sendmsg() per datagram. Under the global lock the
+// service thread builds every connection's packets for this pass, so instead of a
+// syscall each they are copied into a per-socket pending array and handed to the
+// kernel in ONE sendmmsg() right before the lock is released (PollRawUDPSockets).
+// Only the service thread's locked pass batches: s_bBatchUDPSends is set after it
+// takes the lock and cleared after the flush before it lets go, so an API thread
+// that sends under the lock (handshake, close) still sends at once. Linux only;
+// every other platform keeps the per-datagram path. The wire bytes are the same.
+#if defined(__linux__) && !defined(__ANDROID__) && !defined(PLATFORM_NO_SENDMSG)
+	#define REVATE_UDP_SENDMMSG 1
+#else
+	#define REVATE_UDP_SENDMMSG 0
+#endif
+#if REVATE_UDP_SENDMMSG
+	constexpr int k_nRevateUDPBatchSlots = 64;
+	constexpr int k_cbRevateUDPBatchSlot = 2048;   // > k_cbSteamNetworkingSocketsMaxUDPMsgLen; bigger goes direct
+	struct RevatePendingUDPSend
+	{
+		sockaddr_storage m_adr;
+		socklen_t m_addrLen;
+		int m_cb;
+		char m_buf[ k_cbRevateUDPBatchSlot ];
+	};
+	struct RevateUDPBatch
+	{
+		int m_nPending = 0;
+		RevatePendingUDPSend m_slots[ k_nRevateUDPBatchSlots ];
+	};
+	static bool s_bBatchUDPSends = false;   // service thread's locked pass only (written under the global lock)
+	static std::atomic<uint64_t> s_nRevateUDPBatchDatagrams{0}, s_nRevateUDPBatchCalls{0}, s_nRevateUDPBatchMax{0};
+	static void FlushAllPendingUDPSends();
+#endif
 
 int g_cbUDPSocketBufferSize = 256*1024;
 
@@ -384,6 +420,10 @@ public:
 
 	~CRawUDPSocketImpl()
 	{
+		#if REVATE_UDP_SENDMMSG
+			FlushPendingSends();
+			delete m_pRevateBatch;
+		#endif
 		closesocket( m_socket );
 	}
 
@@ -408,6 +448,13 @@ public:
 	// Implements IRawUDPSocket
 	virtual bool BSendRawPacketGather( int nChunks, const iovec *pChunks, const netadr_t &adrTo, int ecn = -1 ) const override;
 	virtual void Close() override;
+
+	#if REVATE_UDP_SENDMMSG
+		/// Datagrams copied here during the service thread's locked pass, sent
+		/// with one sendmmsg by FlushPendingSends (allocated on first use).
+		mutable RevateUDPBatch *m_pRevateBatch = nullptr;
+		void FlushPendingSends() const;
+	#endif
 
 	//// Send a packet, for really realz right now.  (No checking for fake loss or lag.)
 	inline bool BReallySendRawPacket( int nChunks, const iovec *pChunks, const netadr_t &adrTo, int ecn ) const
@@ -553,6 +600,30 @@ public:
 			COMPILE_TIME_ASSERT( !PlatformCanSendECN() );
 
 			bool bResult;
+			#if REVATE_UDP_SENDMMSG
+			int cbRevateTotal = 0;
+			for ( int i = 0 ; i < nChunks ; ++i )
+				cbRevateTotal += (int)pChunks[i].iov_len;
+			if ( s_bBatchUDPSends && cbRevateTotal <= k_cbRevateUDPBatchSlot )
+			{
+				if ( !m_pRevateBatch )
+					m_pRevateBatch = new RevateUDPBatch;
+				if ( m_pRevateBatch->m_nPending >= k_nRevateUDPBatchSlots )
+					FlushPendingSends();
+				RevatePendingUDPSend &slot = m_pRevateBatch->m_slots[ m_pRevateBatch->m_nPending++ ];
+				memcpy( &slot.m_adr, &destAddress, addrSize );
+				slot.m_addrLen = addrSize;
+				slot.m_cb = cbRevateTotal;
+				char *d = slot.m_buf;
+				for ( int i = 0 ; i < nChunks ; ++i )
+				{
+					memcpy( d, pChunks[i].iov_base, pChunks[i].iov_len );
+					d += pChunks[i].iov_len;
+				}
+				bResult = true;   // queued; the kernel's answer comes at the flush
+			}
+			else
+			#endif
 			if ( nChunks == 1 )
 			{
 				ssize_t r = sendto( m_socket, pChunks->iov_base, pChunks->iov_len, 0, (sockaddr *)&destAddress, addrSize );
@@ -1203,6 +1274,59 @@ inline SteamNetworkingMicroseconds RandomJitter( const GlobalConfigValue<float> 
 	return (SteamNetworkingMicroseconds)( flJitterMS * 1000.0f );
 }
 
+#if REVATE_UDP_SENDMMSG
+void CRawUDPSocketImpl::FlushPendingSends() const
+{
+	if ( !m_pRevateBatch || m_pRevateBatch->m_nPending <= 0 )
+		return;
+	const int n = m_pRevateBatch->m_nPending;
+	m_pRevateBatch->m_nPending = 0;
+	if ( m_socket == INVALID_SOCKET )
+		return;
+	mmsghdr hdrs[ k_nRevateUDPBatchSlots ];
+	iovec iovs[ k_nRevateUDPBatchSlots ];
+	for ( int i = 0 ; i < n ; ++i )
+	{
+		RevatePendingUDPSend &slot = m_pRevateBatch->m_slots[i];
+		iovs[i].iov_base = slot.m_buf;
+		iovs[i].iov_len = (size_t)slot.m_cb;
+		memset( &hdrs[i], 0, sizeof(hdrs[i]) );
+		hdrs[i].msg_hdr.msg_name = &slot.m_adr;
+		hdrs[i].msg_hdr.msg_namelen = slot.m_addrLen;
+		hdrs[i].msg_hdr.msg_iov = &iovs[i];
+		hdrs[i].msg_hdr.msg_iovlen = 1;
+	}
+	int sent = 0;
+	int nRetries = 0;
+	while ( sent < n )
+	{
+		int r = sendmmsg( m_socket, hdrs + sent, (unsigned)(n - sent), 0 );
+		if ( r > 0 )
+		{
+			sent += r;
+			continue;
+		}
+		// -1: a transient refusal (EAGAIN/EINTR) gets one more try; any other
+		// error is THIS datagram's (an unreachable peer, a firewall) — skip it
+		// alone and keep sending the rest, as one sendmsg per datagram did.
+		if ( r < 0 && ( errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK ) && nRetries++ < 1 )
+			continue;
+		nRetries = 0;
+		++sent;
+	}
+	s_nRevateUDPBatchCalls.fetch_add( 1, std::memory_order_relaxed );
+	s_nRevateUDPBatchDatagrams.fetch_add( (uint64_t)n, std::memory_order_relaxed );
+	uint64_t prevMax = s_nRevateUDPBatchMax.load( std::memory_order_relaxed );
+	while ( (uint64_t)n > prevMax && !s_nRevateUDPBatchMax.compare_exchange_weak( prevMax, (uint64_t)n, std::memory_order_relaxed ) ) {}
+}
+
+static void FlushAllPendingUDPSends()
+{
+	for ( CRawUDPSocketImpl *pSock: s_vecRawSockets )
+		pSock->FlushPendingSends();
+}
+#endif
+
 bool CRawUDPSocketImpl::BSendRawPacketGather( int nChunks, const iovec *pChunks, const netadr_t &adrTo, int ecn ) const
 {
 	SteamNetworkingGlobalLock::AssertHeldByCurrentThread();
@@ -1316,6 +1440,9 @@ void CRawUDPSocketImpl::InternalAddToCleanupQueue()
 void CRawUDPSocketImpl::Close()
 {
 	SteamNetworkingGlobalLock::AssertHeldByCurrentThread( "IRawUDPSocket::Close" );
+	#if REVATE_UDP_SENDMMSG
+		FlushPendingSends();   // a close packet queued this pass still goes out
+	#endif
 
 	// Mark the callback as detached, and put us in the queue for cleanup when it's safe.
 	InternalAddToCleanupQueue();
@@ -2644,6 +2771,10 @@ static bool PollRawUDPSockets( int nMaxTimeoutMS, bool bManualPoll )
 	#endif
 
 	// Release lock while we're asleep
+	#if REVATE_UDP_SENDMMSG
+		FlushAllPendingUDPSends();   // this pass's datagrams, one sendmmsg per socket
+		s_bBatchUDPSends = false;
+	#endif
 	SteamNetworkingGlobalLock::Unlock();
 
 	// Run idle tasks since we don't have the lock.
@@ -2688,6 +2819,9 @@ static bool PollRawUDPSockets( int nMaxTimeoutMS, bool bManualPoll )
 		if ( SteamNetworkingGlobalLock::TryLock( "ServiceThread", 20 ) )
 			break;
 	}
+	#if REVATE_UDP_SENDMMSG
+		s_bBatchUDPSends = true;   // the service thread's locked pass: batch until the next release
+	#endif
 
 	// If we waited a long time, then that's probably bad.  Spew about it
 	#ifdef DBGFLAG_ASSERT
@@ -4397,3 +4531,18 @@ void TEST_mocknetwork_init( const TEST_mocknetwork_config_t &config )
 }
 
 #endif // STEAMNETWORKINGSOCKETS_ENABLE_MOCK
+
+// ── REVATE: batched UDP send census (read by the server's [NetThread] line) ────
+STEAMNETWORKINGSOCKETS_INTERFACE void SteamNetworkingSockets_RevateUDPBatchStats( uint64 *pnDatagrams, uint64 *pnCalls, uint64 *pnMaxBatch )
+{
+	#if REVATE_UDP_SENDMMSG
+		using namespace SteamNetworkingSocketsLib;
+		if ( pnDatagrams ) *pnDatagrams = s_nRevateUDPBatchDatagrams.load( std::memory_order_relaxed );
+		if ( pnCalls ) *pnCalls = s_nRevateUDPBatchCalls.load( std::memory_order_relaxed );
+		if ( pnMaxBatch ) *pnMaxBatch = s_nRevateUDPBatchMax.load( std::memory_order_relaxed );
+	#else
+		if ( pnDatagrams ) *pnDatagrams = 0;
+		if ( pnCalls ) *pnCalls = 0;
+		if ( pnMaxBatch ) *pnMaxBatch = 0;
+	#endif
+}
