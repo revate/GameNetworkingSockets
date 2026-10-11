@@ -16,12 +16,14 @@
 
 // Set STEAMNETWORKINGSOCKETS_LOCK_DEBUG_LEVEL.
 // NOTE: Currently only 0 or 1 is allowed.  Later we might add more flexibility
+// REVATE: 0 by default, even though DBGFLAG_ASSERT stays on in release. Level 1
+// costs every outermost lock three clock reads (AboutToLock, OnLocked, AboutToUnlock)
+// plus a per-thread held-lock list, on the service thread and on every API call the
+// game tick makes; its only output is the long-lock-held / lock-wait spew, which the
+// engine's debug sink already drops unless REVATE_NET_DEBUG. Build with
+// -DSTEAMNETWORKINGSOCKETS_LOCK_DEBUG_LEVEL=1 to get the lock-order checks back.
 #ifndef STEAMNETWORKINGSOCKETS_LOCK_DEBUG_LEVEL
-	#ifdef DBGFLAG_ASSERT
-		#define STEAMNETWORKINGSOCKETS_LOCK_DEBUG_LEVEL 1
-	#else
-		#define STEAMNETWORKINGSOCKETS_LOCK_DEBUG_LEVEL 0
-	#endif
+	#define STEAMNETWORKINGSOCKETS_LOCK_DEBUG_LEVEL 0
 #endif
 
 struct iovec;
