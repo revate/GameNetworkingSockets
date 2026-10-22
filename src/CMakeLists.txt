@@ -390,6 +390,14 @@ macro(set_clientlib_target_properties GNS_TARGET)
 		#if(USE_STEAMWEBRTC AND NOT STEAMWEBRTC_USE_STATIC_LIBS)
 		#	target_link_libraries(${GNS_TARGET} PRIVATE dl)
 		#endif()
+		if(ANDROID)
+			# OpenSSL's libcrypto.a (linked statically) references
+			# __android_log_write; static libs don't carry their lib deps, so
+			# link Android's liblog (+ libandroid) here, after the objects.
+			# (The upstream `elseif(... Android)` branch below is shadowed by
+			# the Linux-OR-ANDROID branch, so it must be repeated here.)
+			target_link_libraries(${GNS_TARGET} PUBLIC log android)
+		endif()
 	elseif(APPLE)
 		# macOS, iOS, tvOS, watchOS, visionOS.  The sockets and threading we use
 		# are all in libSystem, but Abseil's time-zone support (pulled in by
