@@ -443,6 +443,11 @@ struct SSNPSenderState
 	/// Each entry is a handle into m_listSentReliableSegments
 	CUtlLinkedList<uint16,uint16> m_listReadyRetryReliableRange;
 
+	/// REVATE (2026-10-29): the last node inserted into m_listReadyRetryReliableRange,
+	/// a starting point for the next insert (steamnetworkingsockets_snp_retry_order.h).
+	/// Only a hint: it may have been removed or reused since, and is checked before use.
+	uint16 m_hRetryInsertHint = 0xffff;
+
 	/// Called when we discard a packet after having nacked it
 	void RemoveRefCountReliableSegment( uint16 hSeg );
 

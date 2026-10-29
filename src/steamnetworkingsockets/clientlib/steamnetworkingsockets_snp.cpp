@@ -2,6 +2,7 @@
 
 #include "steamnetworkingsockets_snp.h"
 #include "steamnetworkingsockets_connections.h"
+#include "steamnetworkingsockets_snp_retry_order.h"
 #include "crypto.h"
 
 #include <tier0/valve_tracelogging.h> // Includes windows.h :(  Include this last before memdbgon
@@ -1554,25 +1555,35 @@ void CSteamNetworkConnectionBase::SNP_QueueReliableSegmentsForRetry( SNPInFlight
 			continue;
 
 		// Schedule retry.
-		// !KLUDGE! We need to make sure that any retries are in order,
-		// in a given lane.  Here we assume that the retry queue is relatively
-		// short, and scanning it linearly is going to be better than maintaining
-		// a queue structure.  This is very likely to be true because we never send
-		// new packets in flight while there is data to be retries.
-		uint16 hLinkBefore = m_senderState.m_listReadyRetryReliableRange.Head();
-		while ( hLinkBefore != m_senderState.m_listReadyRetryReliableRange.InvalidIndex() )
-		{
-			uint16 hLinkBeforeSeg = m_senderState.m_listReadyRetryReliableRange[ hLinkBefore ];
-			SNPSendReliableSegment_t &linkBeforeSeg = m_senderState.m_listSentReliableSegments[ hLinkBeforeSeg ];
-			DbgAssert( linkBeforeSeg.m_hStatusOrRetry == hLinkBefore );
-
-			if ( linkBeforeSeg.m_pMsg->m_idxLane == relSeg.m_pMsg->m_idxLane
-				&& linkBeforeSeg.begin() > relSeg.begin() )
-				break;
-
-			hLinkBefore = m_senderState.m_listReadyRetryReliableRange.Next( hLinkBefore );
-		}
+		// Retries must stay in order within a lane: the new segment goes
+		// immediately before the FIRST same-lane entry whose begin() is greater
+		// (or at the tail when there is none).
+		//
+		// REVATE (2026-10-29): upstream scanned FORWARD from the head here,
+		// assuming the retry queue is short. It is not when a peer with a big
+		// unacked backlog of small reliable messages times out: every segment
+		// of every nacked packet walked the whole queue — O(n^2) under the
+		// connection lock on the one service thread that serves every peer.
+		// Measured on a Miner's Haven soak server: 96% of the GNS service
+		// thread's CPU in this function, the tick thread parked on the
+		// connection lock up to 25 s, every peer timed out at once.
+		//
+		// Walk from both ends and from the previous insert in lock step (same
+		// node as the forward scan: removals and the head-first send walk keep
+		// each lane sorted). An in-order timeout wave stops at the tail; a run of
+		// timed-out resends lands next to the previous insert, wherever that is.
+		// See steamnetworkingsockets_snp_retry_order.h.
+		const uint16 hLinkBefore = SNP_FindRetryInsertBefore( m_senderState.m_listReadyRetryReliableRange,
+			relSeg.m_pMsg->m_idxLane, relSeg.begin(),
+			[this]( uint16 h, int &nLane, int64 &nBegin )
+			{
+				const SNPSendReliableSegment_t &segH = m_senderState.m_listSentReliableSegments[ m_senderState.m_listReadyRetryReliableRange[ h ] ];
+				DbgAssert( segH.m_hStatusOrRetry == h );
+				nLane = segH.m_pMsg->m_idxLane;
+				nBegin = segH.begin();
+			}, m_senderState.m_hRetryInsertHint );
 		relSeg.m_hStatusOrRetry = m_senderState.m_listReadyRetryReliableRange.InsertBefore( hLinkBefore );
+		m_senderState.m_hRetryInsertHint = relSeg.m_hStatusOrRetry;
 		m_senderState.m_listReadyRetryReliableRange[ relSeg.m_hStatusOrRetry ] = hSeg;
 
 		const int cbSeg = relSeg.m_cbSize;
