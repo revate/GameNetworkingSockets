@@ -32,8 +32,11 @@ struct SNPAckSerializerHelper
 		int16 m_cbTotalEncodedSize;
 	};
 
-	enum { k_cbHeaderSize = 7 };   // revate: 1 + 32-bit latest pkt num + 16-bit time (was 5, 16-bit pkt num)
+	enum { k_cbHeaderSize = 7 };   // revate: the LARGEST header, 1 + 32-bit latest pkt num + 16-bit time; see AckHeaderSize
 	enum { k_nMaxBlocks = 64 };
+	// revate: 32-bit latest pkt num (7 bytes) for a peer on protocol 13+; 16 bits (5) below it, because decoders before
+	// 13 ignore the w bit and always read 16 (SNP_WIRE_FORMAT.md). 0 = not known yet: the safe 16 bits.
+	static int AckHeaderSize( uint32 nPeerProtocolVersion ) { return nPeerProtocolVersion >= 13 ? 7 : 5; }
 	int m_nBlocks;
 	int m_nBlocksNeedToAck; // Number of blocks we really need to send now.
 	Block m_arBlocks[ k_nMaxBlocks ];
@@ -2443,9 +2446,10 @@ int CSteamNetworkConnectionBase::SNP_SerializePacketInternal( SNPPacketSerialize
 	if ( m_statsEndToEnd.m_nMaxRecvPktNum > 0 )
 	{
 		int cbPayloadRemainingForAcks = helper.m_pPayloadEnd - pPayloadPtr;
-		if ( cbPayloadRemainingForAcks >= SNPAckSerializerHelper::k_cbHeaderSize )
+		const int cbAckHeader = SNPAckSerializerHelper::AckHeaderSize( m_statsEndToEnd.m_nPeerProtocolVersion );
+		if ( cbPayloadRemainingForAcks >= cbAckHeader )
 		{
-			cbReserveForAcks = SNPAckSerializerHelper::k_cbHeaderSize;
+			cbReserveForAcks = cbAckHeader;
 			int n = 3; // Assume we want to send a handful
 			n = std::max( n, helper.m_acks.m_nBlocksNeedToAck ); // But if we have blocks that need to be flushed now, try to fit all of them
 			n = std::min( n, helper.m_acks.m_nBlocks ); // Cannot send more than we actually have
@@ -2897,7 +2901,7 @@ void CSteamNetworkConnectionBase::SNP_GatherAckBlocks( SNPPacketSerializeHelper 
 	n = std::min( (int)helper.m_acks.k_nMaxBlocks, n );
 	auto itNext = m_receiverState.m_mapPacketGaps.begin();
 
-	int cbEncodedSize = helper.m_acks.k_cbHeaderSize;
+	int cbEncodedSize = SNPAckSerializerHelper::AckHeaderSize( m_statsEndToEnd.m_nPeerProtocolVersion );
 	while ( n > 0 )
 	{
 		--n;
@@ -2968,25 +2972,34 @@ uint8 *CSteamNetworkConnectionBase::SNP_SerializeAckBlocks( const SNPPacketSeria
 	Assert( m_statsEndToEnd.m_nMaxRecvPktNum > 0 );
 
 	// No room even for the header?
-	if ( pOut + SNPAckSerializerHelper::k_cbHeaderSize > pOutEnd )
+	const int cbAckHeader = SNPAckSerializerHelper::AckHeaderSize( m_statsEndToEnd.m_nPeerProtocolVersion );
+	if ( pOut + cbAckHeader > pOutEnd )
 		return pOut;
 
 	// !KLUDGE! For now limit number of blocks.
-	// revate: always the 32-bit latest packet number (upstream always sent 16 bits). The sender rebuilds it near its
+	// revate: the 32-bit latest packet number to a protocol 13+ peer (upstream always sent 16 bits). The sender rebuilds it near its
 	// own next send number, so a receiver more than 32k packets behind (~8 s at 4000 pps: a client below 1 fps refusing
 	// segments) was decoded into the future (dropped) or onto a recent in-flight packet (accepted): segments the client
 	// refused were marked acked and never resent, a permanent hole (leak-soak nightlies 11-03/11-06, every launcher).
-	// Every decoder reads the 32-bit form (the w bit, 0x08, clear).
+	// A protocol 13+ decoder reads the 32-bit form (the w bit, 0x08, clear); older ones get the 16 bits they read.
 	COMPILE_TIME_ASSERT( SNPAckSerializerHelper::k_cbHeaderSize == 7 );
+	const bool bAck32 = cbAckHeader == 7;
 	uint8 *pAckHeaderByte = pOut;
 	++pOut;
-	uint32 *pLatestPktNum = (uint32 *)pOut;
-	pOut += 4;
+	uint8 *pLatestPktNum = pOut;
+	pOut += bAck32 ? 4 : 2;
+	auto WriteLatestPktNum = [pLatestPktNum, bAck32]( int64 nPktNum )
+	{
+		if ( bAck32 )
+			*(uint32 *)pLatestPktNum = LittleDWord( uint32( nPktNum ) );
+		else
+			*(uint16 *)pLatestPktNum = LittleWord( uint16( nPktNum ) );
+	};
 	uint16 *pTimeSinceLatestPktNum = (uint16 *)pOut;
 	pOut += 2;
 
-	// 10010000 - ack frame designator, with 32-bit last-received sequence number, and no ack blocks
-	*pAckHeaderByte = 0x90;
+	// 1001w000 - ack frame designator, with a 32-bit (w=0) or 16-bit (w=1) last-received sequence number, no ack blocks
+	*pAckHeaderByte = bAck32 ? 0x90 : 0x98;
 
 	int nLogLevelPacketDecode = m_connectionConfig.LogLevel_PacketDecode.Get();
 
@@ -3005,7 +3018,7 @@ uint8 *CSteamNetworkConnectionBase::SNP_SerializeAckBlocks( const SNPPacketSeria
 	// Fast case for no packet loss we need to ack, which will (hopefully!) be a common case
 	if ( m_receiverState.m_mapPacketGaps.size() == 1 )
 	{
-		*pLatestPktNum = LittleDWord( (uint32)nLastPktToAck );
+		WriteLatestPktNum( nLastPktToAck );
 		*pTimeSinceLatestPktNum = LittleWord( (uint16)SNPAckSerializerHelper::EncodeTimeSince( helper.UsecNow(), usecWhenRecvLastPktToAck ) );
 
 		SpewDebugGroup( nLogLevelPacketDecode, "[%s]   encode pkt %lld last recv %lld (no loss)\n",
@@ -3036,7 +3049,7 @@ uint8 *CSteamNetworkConnectionBase::SNP_SerializeAckBlocks( const SNPPacketSeria
 		{
 			auto itOldestGap = m_receiverState.m_mapPacketGaps.begin();
 			int64 nLastRecvPktNum = itOldestGap->first-1;
-			*pLatestPktNum = LittleDWord( uint32( nLastRecvPktNum ) );
+			WriteLatestPktNum( nLastRecvPktNum );
 			*pTimeSinceLatestPktNum = LittleWord( (uint16)SNPAckSerializerHelper::EncodeTimeSince( helper.UsecNow(), itOldestGap->second.m_usecWhenReceivedPktBefore ) );
 
 			SpewDebugGroup( nLogLevelPacketDecode, "[%s]   encode pkt %lld last recv %lld (no blocks, actual last to ack=%lld)\n",
@@ -3091,7 +3104,7 @@ uint8 *CSteamNetworkConnectionBase::SNP_SerializeAckBlocks( const SNPPacketSeria
 	const SNPAckSerializerHelper::Block *pBlock = &helper.m_acks.m_arBlocks[nBlocks-1];
 
 	// Latest packet number and time
-	*pLatestPktNum = LittleDWord( uint32( pBlock->m_nLatestPktNum ) );
+	WriteLatestPktNum( pBlock->m_nLatestPktNum );
 	*pTimeSinceLatestPktNum = LittleWord( pBlock->m_nEncodedTimeSinceLatestPktNum );
 
 	// Last packet number, for spew
